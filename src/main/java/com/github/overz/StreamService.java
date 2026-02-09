@@ -3,6 +3,7 @@ package com.github.overz;
 import com.github.overz.dtos.*;
 import com.github.overz.processors.*;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsBuilder;
@@ -13,18 +14,27 @@ import org.apache.kafka.streams.state.Stores;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.InitializingBean;
 
-import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
-import java.util.StringJoiner;
+import java.util.Set;
 
+@Slf4j
 @RequiredArgsConstructor
 public class StreamService implements InitializingBean, DisposableBean {
+	private static final String PAGE_STORE_NAME = "pagination-page-store";
+	private static final String METADATA_STORE_NAME = "pagination-metadata-store";
+	private static final String SUMMARY_STORE_NAME = "pagination-summary-store";
+	private static final String REGISTRATION_STORE_NAME = "pagination-registrations-store";
+	private static final String ACK_STORE_NAME = "pagination-acks-store";
+
+	private final String consumersTopic;
+	private final String ackTopic;
 	private final StreamsBuilder builder;
 	private final List<Queue> queues;
 	private final Serde<PageData> pageDataSerdes;
 	private final Serde<PageMetadata> pageMetadataSerdes;
 	private final Serde<PaginationSummary> paginationSummarySerdes;
+	private final Serde<Set<String>> hashSetSerde;
 
 	@Override
 	public void afterPropertiesSet() throws Exception {
@@ -35,75 +45,82 @@ public class StreamService implements InitializingBean, DisposableBean {
 	public void destroy() throws Exception {
 		try {
 			pageDataSerdes.close();
+			pageMetadataSerdes.close();
+			paginationSummarySerdes.close();
 		} catch (Exception _) {
 			// ignored
 		}
-	}
-
-	private String concat(final String v, final String... parts) {
-		final var joiner = new StringJoiner("-").add(v);
-		Arrays.stream(parts).forEach(joiner::add);
-		return joiner.toString();
 	}
 
 	public void buildStream() {
 		final var stringSerdes = Serdes.String();
 		final var genericSerdes = Serdes.ByteArray();
 
+		final var pageStorage = Stores.keyValueStoreBuilder(
+			Stores.persistentKeyValueStore(PAGE_STORE_NAME), stringSerdes, pageDataSerdes
+		);
+		final var metadataStorage = Stores.keyValueStoreBuilder(
+			Stores.persistentKeyValueStore(METADATA_STORE_NAME), stringSerdes, pageMetadataSerdes
+		);
+		final var summaryStorage = Stores.keyValueStoreBuilder(
+			Stores.persistentKeyValueStore(SUMMARY_STORE_NAME), stringSerdes, paginationSummarySerdes
+		);
+		final var registrationStorage = Stores.keyValueStoreBuilder(
+			Stores.persistentKeyValueStore(REGISTRATION_STORE_NAME), stringSerdes, hashSetSerde
+		);
+		final var ackStorage = Stores.keyValueStoreBuilder(
+			Stores.persistentKeyValueStore(ACK_STORE_NAME), stringSerdes, hashSetSerde
+		);
+
+		builder
+			.addStateStore(pageStorage)
+			.addStateStore(metadataStorage)
+			.addStateStore(summaryStorage)
+			.addStateStore(registrationStorage)
+			.addStateStore(ackStorage);
+
+		final var maxMessageSize = Optional.ofNullable(System.getenv("MAX_MESSAGE_SIZE"))
+			.map(Integer::parseInt)
+			.orElse(900 * 1024);
+
 		for (final var q : queues) {
-			final var summary = concat(q.input(), "summary");
-			final var page = concat(q.input(), "page");
-			final var metadata = concat(q.input(), "metadata");
-			final var repartition = concat(q.input(), "repartition");
-
-			final var pageStorage = Stores.windowStoreBuilder(
-				Stores.persistentWindowStore(page, q.retentionTime(), q.windowTime(), q.retainDuplicates()),
-				stringSerdes,
-				pageDataSerdes
-			);
-
-			final var metadataStorage = Stores.keyValueStoreBuilder(
-				Stores.persistentKeyValueStore(metadata),
-				stringSerdes,
-				pageMetadataSerdes
-			);
-
-			final var summaryStorage = Stores.keyValueStoreBuilder(
-				Stores.persistentKeyValueStore(summary),
-				stringSerdes,
-				paginationSummarySerdes
-			);
+			final var repartitionName = q.input() + "-pagination-repartition";
 
 			final var repartitioned = Repartitioned.<String, PageData>numberOfPartitions(q.repartitions())
-				.withName(repartition)
+				.withName(repartitionName)
 				.withKeySerde(stringSerdes)
 				.withValueSerde(pageDataSerdes);
 
-			builder
-				.addStateStore(pageStorage)
-				.addStateStore(metadataStorage)
-				.addStateStore(summaryStorage)
-				.stream(q.input(), Consumed.with(genericSerdes, genericSerdes))
-				// Validate message size to ensure it fits within Kafka limits
-				.process(() -> new MessageValidatorProcessor(
-					Optional.ofNullable(System.getenv("MAX_MESSAGE_SIZE")).map(Integer::parseInt).orElse(9 * 1024 * 1024)
-				))
-				// Extract headers and body to a DTO to unify processing logic
+			builder.stream(q.input(), Consumed.with(genericSerdes, genericSerdes))
+				.process(() -> new MessageValidatorProcessor(maxMessageSize))
 				.process(() -> new ExtractDataProcessor(pageDataSerdes.serializer()))
-				// Use pagination_id as key to group related messages
 				.selectKey((k, v) -> k)
-				// Repartition to ensure all pages of the same group are in the same partition
 				.repartition(repartitioned)
-				// Persist page content for later retrieval
-				.process(() -> new PageDataProcessor(page), page)
-				// Persist page metadata to track individual message details
-				.process(() -> new PageMetadataProcessor(metadata, pageMetadataSerdes.serializer()), metadata)
-				// Aggregate completion status to check if all pages arrived
-				.process(() -> new PaginationSummaryProcessor(summary), summary)
-				// Only downstream the event if all pages are collected
+				.process(() -> new PageDataProcessor(PAGE_STORE_NAME), PAGE_STORE_NAME)
+				.process(() -> new PageMetadataProcessor(METADATA_STORE_NAME, pageMetadataSerdes.serializer()), METADATA_STORE_NAME)
+				.process(() -> new PaginationSummaryProcessor(SUMMARY_STORE_NAME), SUMMARY_STORE_NAME)
 				.filter((key, value) -> value != null && value.status() == PaginationStatus.COMPLETED)
-				.to(q.output(), Produced.with(stringSerdes, paginationSummarySerdes))
-			;
+				.to(q.output(), Produced.with(stringSerdes, paginationSummarySerdes));
 		}
+
+		builder.stream(consumersTopic, Consumed.with(stringSerdes, stringSerdes))
+			.filter((key, value) -> key != null && value != null)
+			.peek((key, value) -> log.info(
+				"Registering interest for pagination-id'{}' from consumer '{}'", key, value
+			))
+			.process(() -> new RegistrationProcessor(REGISTRATION_STORE_NAME));
+
+		builder.stream(ackTopic, Consumed.with(stringSerdes, stringSerdes))
+			.filter((key, value) -> key != null && value != null)
+			.peek((key, value) -> log.info(
+				"Received ack confirmation for pagination-id '{}' from consumer '{}'", key, value
+			))
+			.process(() -> new AckProcessor(
+				PAGE_STORE_NAME,
+				METADATA_STORE_NAME,
+				SUMMARY_STORE_NAME,
+				REGISTRATION_STORE_NAME,
+				ACK_STORE_NAME
+			));
 	}
 }

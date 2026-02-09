@@ -13,4 +13,13 @@ public record PaginationData(
 	PageData page,
 	PageMetadata metadata
 ) implements Serializable {
+
+	public PaginationData {
+		if (page == null) {
+			throw new IllegalArgumentException("page cannot be null");
+		}
+		if (metadata == null) {
+			throw new IllegalArgumentException("metadata cannot be null");
+		}
+	}
 }

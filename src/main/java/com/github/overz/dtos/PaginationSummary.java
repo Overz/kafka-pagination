@@ -5,6 +5,7 @@ import lombok.With;
 import lombok.extern.jackson.Jacksonized;
 
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.List;
 
 @With
@@ -19,14 +20,7 @@ public record PaginationSummary(
 ) implements Serializable {
 
 	public PaginationSummary {
-		if (totalPages <= -1) {
-			throw new IllegalArgumentException("totalPages must be positive");
-		}
-
-		if (totalElements <= -1) {
-			throw new IllegalArgumentException("totalElements must be positive");
-		}
-
+		// Removed strict validation for totalPages/totalElements as they might be unknown (-1) initially
 		if (totalSize <= -1) {
 			throw new IllegalArgumentException("totalSize must be positive");
 		}
@@ -37,12 +31,21 @@ public record PaginationSummary(
 	}
 
 	public static PaginationSummary newSummary(final MessageHeaders headers) {
+		final var refs = new ArrayList<String>();
+		refs.add(headers.compositeKey());
+		
+		// If this first message is the last page (has totalElements), we know the totals.
+		// Otherwise, we initialize with -1 (unknown).
+		final boolean isLastPage = headers.totalElements() > 0;
+		final int totalPages = isLastPage ? headers.pageNumber() : -1;
+		final int totalElements = isLastPage ? headers.totalElements() : -1;
+
 		return PaginationSummary.builder()
-			.totalPages(headers.pageSize())
-			.totalElements(headers.totalElements())
+			.totalPages(totalPages)
+			.totalElements(totalElements)
 			.totalSize(headers.keySize() + headers.valueSize())
-			.status(headers.totalElements() != 0 ? PaginationStatus.COMPLETED : PaginationStatus.OPEN)
-			.references(List.of(headers.compositeKey()))
+			.status(PaginationStatus.OPEN)
+			.references(refs)
 			.build();
 	}
 }

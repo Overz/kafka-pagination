@@ -32,32 +32,54 @@ public class PaginationSummaryProcessor implements Processor<String, PaginationD
 	public void process(final Record<String, PaginationData> data) {
 		final var isNew = new AtomicBoolean(false);
 		final var headers = MessageHeaders.fromHeaders(data.headers());
+		final var key = headers.paginationId();
+
 		// Retrieve existing summary or create a new one if it's the first page
-		final var summary = Optional.ofNullable(storage.get(data.key()))
+		var summary = Optional.ofNullable(storage.get(key))
 			.orElseGet(() -> {
 				isNew.set(true);
 				return PaginationSummary.newSummary(headers);
 			});
 
 		if (isNew.get()) {
-			// Ensure new summary is saved
-			storage.put(data.key(), summary);
+			// Even if new, we check status (case of single page pagination)
+			summary = updateStatus(summary);
+			storage.put(key, summary);
 			ctx.forward(data.withValue(summary));
 			return;
 		}
 
-		// Update summary with the new page reference and check for completion
 		summary.references().add(headers.compositeKey());
-		storage.put(data.key(), update(summary, headers));
-		ctx.forward(data.withValue(summary));
+
+		// If this message has the total count (is the last page), update the summary totals
+		if (headers.totalElements() > 0) {
+			summary = summary.withTotalElements(headers.totalElements())
+				.withTotalPages(headers.pageNumber());
+		}
+
+		// Update summary with the new page reference and check for completion
+		final var updatedSummary = updateStatus(summary);
+		storage.put(key, updatedSummary);
+
+		// forward the summary
+		ctx.forward(data.withValue(updatedSummary));
+
+		// remove when completed
+		if (summary.status() == PaginationStatus.COMPLETED) {
+			storage.delete(key);
+		}
 	}
 
-	private PaginationSummary update(
-		final PaginationSummary summary,
-		final MessageHeaders headers
-	) {
-		final var paginationEnded = summary.totalElements() == headers.totalElements() && headers.totalElements() != 0;
-		final var status = paginationEnded ? PaginationStatus.COMPLETED : PaginationStatus.OPEN;
+	private PaginationSummary updateStatus(final PaginationSummary summary) {
+		// We can only be completed if we know the total pages (totalPages != -1)
+		// AND we have collected exactly that many pages.
+		final boolean isTotalKnown = summary.totalPages() != -1;
+		final boolean allPagesReceived = isTotalKnown && summary.references().size() == summary.totalPages();
+
+		final var status = allPagesReceived ?
+			PaginationStatus.COMPLETED :
+			PaginationStatus.OPEN;
+
 		return summary.withStatus(status);
 	}
 }
